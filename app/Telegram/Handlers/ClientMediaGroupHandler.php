@@ -13,7 +13,11 @@ use SergiX44\Nutgram\Nutgram;
 
 class ClientMediaGroupHandler
 {
-    const ALBUM_TIMEOUT = 3; // seconds to wait after LAST photo
+    // Seconds of silence after the latest album item before processing
+    const ALBUM_TIMEOUT = 3;
+
+    // Hard cap in seconds from the first item, so a stream of items can't defer forever
+    const MAX_WAIT = 15;
 
     /**
      * Handle media group (album)
@@ -37,16 +41,7 @@ class ClientMediaGroupHandler
         $cacheKey = "media_group:{$userId}:{$mediaGroupId}";
         $lockKey = "media_group_lock:{$userId}:{$mediaGroupId}";
 
-        // Get or create album cache
-        $album = Cache::get($cacheKey, [
-            'media_group_id' => $mediaGroupId,
-            'user_id' => $userId,
-            'messages' => [],
-            'created_at' => now(),
-        ]);
-
-        // Add current message to album
-        $album['messages'][] = [
+        $item = [
             'message_id' => $message->message_id,
             'chat_id' => $message->chat->id,
             'type' => $this->getMediaType($message),
@@ -54,10 +49,28 @@ class ClientMediaGroupHandler
             'file_id' => $this->getFileId($message),
         ];
 
-        $album['last_update'] = now();
+        // Items of one album arrive as parallel webhooks, so the read-modify-write needs a lock
+        [$album, $hasLock] = Cache::lock("{$cacheKey}:append", 5)->block(5, function () use ($cacheKey, $lockKey, $mediaGroupId, $userId, $item) {
+            $nowMs = now()->getTimestampMs();
 
-        // Store album with LONGER timeout to handle slow webhooks
-        Cache::put($cacheKey, $album, now()->addSeconds(self::ALBUM_TIMEOUT + 5));
+            $album = Cache::get($cacheKey, [
+                'media_group_id' => $mediaGroupId,
+                'user_id' => $userId,
+                'messages' => [],
+                'created_at' => now(),
+                'first_update_at' => $nowMs,
+            ]);
+
+            $album['messages'][] = $item;
+            $album['last_update_at'] = $nowMs;
+
+            Cache::put($cacheKey, $album, now()->addSeconds(self::MAX_WAIT + 30));
+
+            // One scheduled check per album
+            $hasLock = Cache::add($lockKey, true, now()->addSeconds(self::MAX_WAIT + 30));
+
+            return [$album, $hasLock];
+        });
 
         Log::debug('Client media group item received', [
             'media_group_id' => $mediaGroupId,
@@ -66,32 +79,57 @@ class ClientMediaGroupHandler
             'user_id' => $userId,
         ]);
 
-        // Use lock to prevent multiple jobs for same album
-        $hasLock = Cache::add($lockKey, true, now()->addSeconds(self::ALBUM_TIMEOUT + 10));
-
         if ($hasLock) {
-            // First photo or lock acquired - schedule processing
             Log::debug('Scheduling album processing', [
                 'media_group_id' => $mediaGroupId,
                 'timeout' => self::ALBUM_TIMEOUT,
             ]);
 
-            dispatch(function () use ($cacheKey, $userId, $mediaGroupId, $lockKey) {
-                // Wait for all photos to arrive
-                sleep(self::ALBUM_TIMEOUT);
-
-                // Process album
-                $this->processAlbum($cacheKey, $userId, $mediaGroupId);
-
-                // Release lock
-                Cache::forget($lockKey);
-            })->afterResponse();
+            $this->scheduleAlbumCheck($cacheKey, $userId, $mediaGroupId, $lockKey, self::ALBUM_TIMEOUT);
         } else {
             Log::debug('Album processing already scheduled', [
                 'media_group_id' => $mediaGroupId,
                 'current_count' => count($album['messages']),
             ]);
         }
+    }
+
+    private function scheduleAlbumCheck(string $cacheKey, int $userId, string $mediaGroupId, string $lockKey, int $delay): void
+    {
+        dispatch(function () use ($cacheKey, $userId, $mediaGroupId, $lockKey) {
+            $this->checkAlbum($cacheKey, $userId, $mediaGroupId, $lockKey);
+        })->delay($delay);
+    }
+
+    /**
+     * Process the album once no new item arrived for ALBUM_TIMEOUT, or MAX_WAIT is reached
+     */
+    protected function checkAlbum(string $cacheKey, int $userId, string $mediaGroupId, string $lockKey): void
+    {
+        $album = Cache::get($cacheKey);
+
+        if ($album) {
+            $nowMs = now()->getTimestampMs();
+            $quietLeftMs = self::ALBUM_TIMEOUT * 1000 - ($nowMs - $album['last_update_at']);
+            $maxLeftMs = self::MAX_WAIT * 1000 - ($nowMs - $album['first_update_at']);
+
+            if ($quietLeftMs > 0 && $maxLeftMs > 0) {
+                $this->scheduleAlbumCheck($cacheKey, $userId, $mediaGroupId, $lockKey, (int) ceil(min($quietLeftMs, $maxLeftMs) / 1000));
+
+                return;
+            }
+        }
+
+        // Consume album and release the scheduling lock atomically with appends, so a late
+        // item either lands in this album or starts a new one with its own check
+        $album = Cache::lock("{$cacheKey}:append", 5)->block(5, function () use ($cacheKey, $lockKey) {
+            $album = Cache::pull($cacheKey);
+            Cache::forget($lockKey);
+
+            return $album;
+        });
+
+        $this->processAlbum($album, $cacheKey, $userId, $mediaGroupId);
     }
 
     /**
@@ -133,10 +171,8 @@ class ClientMediaGroupHandler
     /**
      * Process complete album and forward to service chat
      */
-    protected function processAlbum(string $cacheKey, int $userId, string $mediaGroupId): void
+    protected function processAlbum(?array $album, string $cacheKey, int $userId, string $mediaGroupId): void
     {
-        $album = Cache::get($cacheKey);
-
         if (! $album || empty($album['messages'])) {
             Log::warning('Client album not found in cache or empty', [
                 'cache_key' => $cacheKey,
@@ -145,8 +181,6 @@ class ClientMediaGroupHandler
 
             return;
         }
-
-        Cache::forget($cacheKey);
 
         Log::info('Processing client media album', [
             'media_group_id' => $mediaGroupId,
